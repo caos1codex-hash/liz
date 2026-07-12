@@ -1,9 +1,7 @@
 # ============================================================
 #  Liz v3.0 — Instalador PowerShell
-#  Descarga liz.exe + hola.exe nativos y los instala.
-#
-#  Uso:
-#    powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/caos1codex-hash/liz/main/install.ps1 | iex"
+#  Solo descarga hola.exe (5.1 MB). Claude Code y el proxy se
+#  instalan automáticamente en la primera ejecución de `hola liz`.
 # ============================================================
 
 $ErrorActionPreference = "Stop"
@@ -21,89 +19,98 @@ Write-Host ""
 #  1. Definir rutas
 # ============================================================
 $INSTALL_DIR = "$env:LOCALAPPDATA\Liz"
-Write-Host "  [1/4] Directorio: $INSTALL_DIR" -ForegroundColor Yellow
+Write-Host "  [1/3] Directorio: $INSTALL_DIR" -ForegroundColor Yellow
 if (-not (Test-Path $INSTALL_DIR)) {
     New-Item -ItemType Directory -Force -Path $INSTALL_DIR | Out-Null
 }
 
 # ============================================================
-#  2. Descargar binarios
+#  2. Descargar hola.exe con reintentos
 # ============================================================
 Write-Host ""
-Write-Host "  [2/4] Descargando binarios nativos..." -ForegroundColor Yellow
+Write-Host "  [2/3] Descargando hola.exe..." -ForegroundColor Yellow
 
-$RELEASE_URL = "https://github.com/caos1codex-hash/liz/releases/download/v3.0.0"
+# URLs de descarga (intentamos varias en orden)
+$urls = @(
+    "https://github.com/caos1codex-hash/liz/releases/download/v3.0.0/hola.exe",
+    "https://raw.githubusercontent.com/caos1codex-hash/liz/main/bin/hola.exe"
+)
 
+$holaDest = Join-Path $INSTALL_DIR "hola.exe"
 $ProgressPreference = "SilentlyContinue"
 
-# Descargar liz.exe
-$lizUrl = "$RELEASE_URL/liz.exe"
-$lizDest = Join-Path $INSTALL_DIR "liz.exe"
-Write-Host "    liz.exe  (5.5 MB) ..." -NoNewline
-try {
-    Invoke-WebRequest -Uri $lizUrl -OutFile $lizDest -UseBasicParsing -TimeoutSec 60
-    $size = (Get-Item $lizDest).Length
-    Write-Host (" OK ({0:N1} MB)" -f ($size/1MB)) -ForegroundColor Green
-} catch {
-    Write-Host " FALLO" -ForegroundColor Red
-    Write-Host "      Error: $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
+$downloaded = $false
+foreach ($url in $urls) {
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        Write-Host "    Intento $attempt de 3 - $url" -NoNewline
+        try {
+            # Usar .NET WebClient que es más estable que Invoke-WebRequest
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add("User-Agent", "LizInstaller/3.0")
+            $wc.DownloadFile($url, $holaDest)
+            $size = (Get-Item $holaDest).Length
+            if ($size -gt 1000000) {
+                Write-Host (" OK ({0:N1} MB)" -f ($size/1MB)) -ForegroundColor Green
+                $downloaded = $true
+                break
+            } else {
+                Write-Host " FALLO (archivo demasiado pequeno)" -ForegroundColor Red
+                Remove-Item $holaDest -ErrorAction SilentlyContinue
+            }
+        } catch {
+            Write-Host " FALLO" -ForegroundColor Red
+            Write-Host "      $($_.Exception.Message)" -ForegroundColor Gray
+        }
+        Start-Sleep -Seconds 2
+    }
+    if ($downloaded) { break }
 }
 
-# Descargar hola.exe
-$holaUrl = "$RELEASE_URL/hola.exe"
-$holaDest = Join-Path $INSTALL_DIR "hola.exe"
-Write-Host "    hola.exe (1.7 MB) ..." -NoNewline
-try {
-    Invoke-WebRequest -Uri $holaUrl -OutFile $holaDest -UseBasicParsing -TimeoutSec 60
-    $size = (Get-Item $holaDest).Length
-    Write-Host (" OK ({0:N1} MB)" -f ($size/1MB)) -ForegroundColor Green
-} catch {
-    Write-Host " FALLO" -ForegroundColor Red
-    Write-Host "      Error: $($_.Exception.Message)" -ForegroundColor Red
+if (-not $downloaded) {
+    Write-Host ""
+    Write-Host "  No se pudo descargar automaticamente." -ForegroundColor Red
+    Write-Host "  Descarga manual desde:" -ForegroundColor Yellow
+    Write-Host "    https://github.com/caos1codex-hash/liz/releases/tag/v3.0.0" -ForegroundColor White
+    Write-Host "  Y copia hola.exe a: $INSTALL_DIR" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  Presiona una tecla para salir..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
     exit 1
 }
 
 # ============================================================
-#  3. Desbloquear archivos (Mark of the Web)
+#  3. Desbloquear + PATH
 # ============================================================
 Write-Host ""
-Write-Host "  [3/4] Desbloqueando archivos..." -ForegroundColor Yellow
-Unblock-File -Path $lizDest -ErrorAction SilentlyContinue
+Write-Host "  [3/3] Configurando..." -ForegroundColor Yellow
+
+# Desbloquear (quitar Mark of the Web)
 Unblock-File -Path $holaDest -ErrorAction SilentlyContinue
-Write-Host "    OK" -ForegroundColor Green
+Write-Host "    OK desbloqueado" -ForegroundColor Green
 
-# ============================================================
-#  4. Agregar al PATH
-# ============================================================
-Write-Host ""
-Write-Host "  [4/4] Anadiendo al PATH..." -ForegroundColor Yellow
-
+# Añadir al PATH
 $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
 if (-not $userPath) { $userPath = "" }
 
 if ($userPath -split ";" -contains $INSTALL_DIR) {
-    Write-Host "    OK ya estaba en PATH" -ForegroundColor Green
+    Write-Host "    OK PATH (ya estaba)" -ForegroundColor Green
 } else {
     $newPath = if ($userPath) { "$INSTALL_DIR;$userPath" } else { $INSTALL_DIR }
     [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
     $env:PATH = "$INSTALL_DIR;$env:PATH"
-    Write-Host "    OK anadido al PATH" -ForegroundColor Green
+    Write-Host "    OK PATH anadido" -ForegroundColor Green
 }
 
 # ============================================================
-#  Verificacion final
+#  Resumen final
 # ============================================================
 Write-Host ""
 Write-Host "  ============================================" -ForegroundColor $PURPLE
 Write-Host "    Instalacion completada!" -ForegroundColor Green
 Write-Host "  ============================================" -ForegroundColor $PURPLE
 Write-Host ""
-Write-Host "  Archivos:" -ForegroundColor White
-Get-ChildItem $INSTALL_DIR -Filter "*.exe" | ForEach-Object {
-    $sizeMB = "{0:N1}" -f ($_.Length / 1MB)
-    Write-Host "    $($_.Name)  ($sizeMB MB)" -ForegroundColor Gray
-}
+Write-Host "  Archivo instalado:" -ForegroundColor White
+Write-Host "    $holaDest" -ForegroundColor Gray
 Write-Host ""
 Write-Host "  Para empezar:" -ForegroundColor White
 Write-Host "    1. CIERRA esta ventana de PowerShell" -ForegroundColor $PINK
@@ -112,5 +119,7 @@ Write-Host "    3. Escribe:" -ForegroundColor $PINK
 Write-Host ""
 Write-Host "       hola liz" -ForegroundColor $PURPLE
 Write-Host ""
-
-Set-Content -Path (Join-Path $INSTALL_DIR "install-success.txt") -Value "Installed on $(Get-Date)" -Encoding UTF8
+Write-Host "  La primera vez tardara un poco porque instalara:" -ForegroundColor Gray
+Write-Host "    - claude-code-proxy (pip)" -ForegroundColor Gray
+Write-Host "    - Claude Code (npm)" -ForegroundColor Gray
+Write-Host ""
