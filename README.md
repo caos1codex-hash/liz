@@ -1,8 +1,8 @@
-# 🌸 Liz v3.0
+# 🌸 Liz v3.1
 
 Liz is an AI coding assistant that uses the **real Claude Code skeleton** with ALL its tools, powered by **GLM-5.2** via **NVIDIA NIM**.
 
-## What's new in v3.0
+## What's new in v3.1
 
 - **Uses the actual Claude Code binary** — not a reimplementation
 - **ALL Claude Code tools available**: multi-file editing, Git, MCP, slash commands, search, bash, etc.

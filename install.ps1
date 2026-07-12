@@ -1,5 +1,5 @@
 # ============================================================
-#  Liz v3.0 — Instalador PowerShell
+#  Liz v3.1 — Instalador PowerShell
 #  Solo descarga hola.exe (5.1 MB). Claude Code y el proxy se
 #  instalan automáticamente en la primera ejecución de `hola liz`.
 # ============================================================
@@ -11,7 +11,7 @@ $PINK   = "Cyan"
 
 Write-Host ""
 Write-Host "  ============================================" -ForegroundColor $PURPLE
-Write-Host "    Liz v3.0 - Instalador" -ForegroundColor $PURPLE
+Write-Host "    Liz v3.1 - Instalador" -ForegroundColor $PURPLE
 Write-Host "  ============================================" -ForegroundColor $PURPLE
 Write-Host ""
 
@@ -32,7 +32,7 @@ Write-Host "  [2/3] Descargando hola.exe..." -ForegroundColor Yellow
 
 # URLs de descarga (intentamos varias en orden)
 $urls = @(
-    "https://github.com/caos1codex-hash/liz/releases/download/v3.0.0/hola.exe",
+    "https://github.com/caos1codex-hash/liz/releases/download/v3.1.0/hola.exe",
     "https://raw.githubusercontent.com/caos1codex-hash/liz/main/bin/hola.exe"
 )
 
@@ -70,7 +70,7 @@ if (-not $downloaded) {
     Write-Host ""
     Write-Host "  No se pudo descargar automaticamente." -ForegroundColor Red
     Write-Host "  Descarga manual desde:" -ForegroundColor Yellow
-    Write-Host "    https://github.com/caos1codex-hash/liz/releases/tag/v3.0.0" -ForegroundColor White
+    Write-Host "    https://github.com/caos1codex-hash/liz/releases/tag/v3.1.0" -ForegroundColor White
     Write-Host "  Y copia hola.exe a: $INSTALL_DIR" -ForegroundColor White
     Write-Host ""
     Write-Host "  Presiona una tecla para salir..." -ForegroundColor Gray

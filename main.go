@@ -1,6 +1,6 @@
-// Liz v3.0 — Single-file launcher.
+// Liz v3.1 — Single-file launcher with custom proxy.
 // Uses the REAL Claude Code skeleton with ALL its tools.
-// Routes requests to GLM-5.2 via NVIDIA NIM through an embedded proxy.
+// Routes requests to GLM-5.2 via NVIDIA NIM through a custom embedded proxy.
 package main
 
 import (
@@ -17,24 +17,262 @@ import (
 //  CONFIG
 // ============================================================
 
-const Version = "3.0.0"
+const Version = "3.1.0"
 
-// Embedded Python proxy script — translates Anthropic Messages API
-// to OpenAI Chat Completions and forwards to NVIDIA NIM (GLM-5.2).
-// Uses the proven claude-code-proxy library under the hood.
+// Custom proxy script — handles system role, tool calls, streaming.
+// Uses litellm for proper Anthropic↔OpenAI translation.
 const proxyScript = `#!/usr/bin/env python3
-import os, sys, socket
-os.environ["OPENAI_API_KEY"]      = "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"
-os.environ["OPENAI_API_BASE"]     = "https://integrate.api.nvidia.com/v1"
-os.environ["BIG_MODEL"]           = "z-ai/glm-5.2"
-os.environ["SMALL_MODEL"]         = "z-ai/glm-5.2"
-os.environ["PREFERRED_PROVIDER"]  = "openai"
-try:
-    from server.fastapi import app
-except ImportError:
-    print("ERROR: claude-code-proxy not installed. Run: pip install claude-code-proxy", file=sys.stderr)
-    sys.exit(1)
+"""Liz Proxy v3.1 — Custom Anthropic-to-OpenAI translation layer."""
+import os, sys, socket, json, uuid
+from typing import Any, Optional, List
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
+import litellm
 import uvicorn
+
+litellm.set_verbose = False
+litellm.drop_params = True  # silently drop unsupported params
+
+app = FastAPI()
+
+NIM_KEY = os.environ.get("OPENAI_API_KEY", "")
+NIM_BASE = os.environ.get("OPENAI_API_BASE", "")
+NIM_MODEL = os.environ.get("BIG_MODEL", "z-ai/glm-5.2")
+
+class Message(BaseModel):
+    role: str = "user"
+    content: Any = None
+    tool_calls: Optional[List[Any]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+    class Config:
+        extra = "allow"
+
+class MessagesRequest(BaseModel):
+    model: str
+    messages: List[Message]
+    max_tokens: int = 4096
+    system: Optional[Any] = None
+    stream: bool = False
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = None
+    tools: Optional[List[Any]] = None
+    tool_choice: Optional[Any] = None
+    stop_sequences: Optional[List[str]] = None
+    metadata: Optional[Any] = None
+    thinking: Optional[Any] = None
+    class Config:
+        extra = "allow"
+
+@app.get("/")
+async def root():
+    return {"message": "Liz Proxy v3.1 (litellm-based)"}
+
+@app.post("/v1/messages")
+async def messages(req: MessagesRequest):
+    litellm_messages = []
+
+    # Add top-level system message
+    if req.system:
+        if isinstance(req.system, str):
+            litellm_messages.append({"role": "system", "content": req.system})
+        elif isinstance(req.system, list):
+            parts = []
+            for s in req.system:
+                if isinstance(s, dict) and s.get("type") == "text":
+                    parts.append(s.get("text", ""))
+            if parts:
+                litellm_messages.append({"role": "system", "content": "\n".join(parts)})
+
+    # Convert each message
+    for msg in req.messages:
+        m = {"role": msg.role}
+
+        if msg.content is None:
+            m["content"] = ""
+        elif isinstance(msg.content, str):
+            m["content"] = msg.content
+        elif isinstance(msg.content, list):
+            # Anthropic content blocks
+            if msg.role == "user":
+                texts = []
+                for block in msg.content:
+                    if not isinstance(block, dict):
+                        continue
+                    t = block.get("type")
+                    if t == "text":
+                        texts.append(block.get("text", ""))
+                    elif t == "tool_result":
+                        c = block.get("content", "")
+                        if isinstance(c, list):
+                            for b in c:
+                                if isinstance(b, dict) and b.get("type") == "text":
+                                    texts.append(b.get("text", ""))
+                        else:
+                            texts.append(str(c))
+                m["content"] = "\n".join(texts) if texts else ""
+            elif msg.role == "assistant":
+                texts = []
+                tool_calls = []
+                for block in msg.content:
+                    if not isinstance(block, dict):
+                        continue
+                    t = block.get("type")
+                    if t == "text":
+                        texts.append(block.get("text", ""))
+                    elif t == "tool_use":
+                        tool_calls.append({
+                            "id": block.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": block.get("name", ""),
+                                "arguments": json.dumps(block.get("input", {})),
+                            },
+                        })
+                m["content"] = "\n".join(texts) if texts else ""
+                if tool_calls:
+                    m["tool_calls"] = tool_calls
+        else:
+            m["content"] = str(msg.content)
+
+        if msg.role == "tool" and msg.tool_call_id:
+            m["tool_call_id"] = msg.tool_call_id
+
+        litellm_messages.append(m)
+
+    kwargs = {
+        "model": f"openai/{NIM_MODEL}",
+        "messages": litellm_messages,
+        "api_base": NIM_BASE,
+        "api_key": NIM_KEY,
+        "max_tokens": req.max_tokens,
+    }
+    if req.temperature is not None:
+        kwargs["temperature"] = req.temperature
+    if req.tools:
+        kwargs["tools"] = req.tools
+    if req.tool_choice:
+        kwargs["tool_choice"] = req.tool_choice
+    if req.stop_sequences:
+        kwargs["stop"] = req.stop_sequences
+
+    try:
+        if req.stream:
+            kwargs["stream"] = True
+            response = await litellm.acompletion(**kwargs)
+            return StreamingResponse(
+                stream_anthropic(response),
+                media_type="text/event-stream",
+            )
+        else:
+            response = await litellm.acompletion(**kwargs)
+            return JSONResponse(convert_to_anthropic(response))
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=f"{e}\n{tb}")
+
+
+async def stream_anthropic(response):
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':{'id':msg_id,'type':'message','role':'assistant','model':NIM_MODEL,'content':[],'stop_reason':None,'stop_sequence':None,'usage':{'input_tokens':0,'output_tokens':0}}})}\n\n"
+    yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
+
+    full_text = ""
+    finish_reason = "end_turn"
+    tool_call_blocks = {}  # index -> {id, name, args}
+
+    async for chunk in response:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if delta:
+            if getattr(delta, "content", None):
+                full_text += delta.content
+                yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':delta.content}})}\n\n"
+            if getattr(delta, "tool_calls", None):
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_call_blocks:
+                        tool_call_blocks[idx] = {"id": "", "name": "", "args": ""}
+                    if tc.id:
+                        tool_call_blocks[idx]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tool_call_blocks[idx]["name"] = tc.function.name
+                        if tc.function.arguments:
+                            tool_call_blocks[idx]["args"] += tc.function.arguments
+        if chunk.choices[0].finish_reason:
+            fr = chunk.choices[0].finish_reason
+            if fr == "stop":
+                finish_reason = "end_turn"
+            elif fr == "tool_calls":
+                finish_reason = "tool_use"
+            elif fr == "length":
+                finish_reason = "max_tokens"
+
+    yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
+
+    # Send tool_use blocks if any
+    for idx in sorted(tool_call_blocks.keys()):
+        tc = tool_call_blocks[idx]
+        try:
+            args = json.loads(tc["args"]) if tc["args"] else {}
+        except:
+            args = {"raw": tc["args"]}
+        block = {"type": "tool_use", "id": tc["id"], "name": tc["name"], "input": args}
+        yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':idx+1,'content_block':block})}\n\n"
+        yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':idx+1})}\n\n"
+
+    yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':finish_reason,'stop_sequence':None},'usage':{'output_tokens':len(full_text)}})}\n\n"
+    yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+def convert_to_anthropic(response):
+    choice = response.choices[0]
+    msg = choice.message
+
+    content = []
+    if getattr(msg, "content", None):
+        content.append({"type": "text", "text": msg.content})
+
+    if getattr(msg, "tool_calls", None):
+        for tc in msg.tool_calls:
+            try:
+                args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            except:
+                args = {"raw": tc.function.arguments}
+            content.append({
+                "type": "tool_use",
+                "id": tc.id,
+                "name": tc.function.name,
+                "input": args,
+            })
+
+    stop_reason = "end_turn"
+    if choice.finish_reason == "tool_calls":
+        stop_reason = "tool_use"
+    elif choice.finish_reason == "length":
+        stop_reason = "max_tokens"
+
+    usage = response.usage
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": NIM_MODEL,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.prompt_tokens if usage else 0,
+            "output_tokens": usage.completion_tokens if usage else 0,
+        },
+    }
+
+
 port = 8082
 while True:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -43,7 +281,9 @@ while True:
     port += 1
 with open(os.path.join(os.environ.get("TEMP", "/tmp"), "liz_port.txt"), "w") as f:
     f.write(str(port))
-uvicorn.run(app, host="127.0.0.1", port=port, log_level="error")
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="error")
 `
 
 // ============================================================
@@ -96,7 +336,7 @@ func main() {
 }
 
 // ============================================================
-//  LAUNCHER — orchestrates proxy + Claude Code
+//  LAUNCHER
 // ============================================================
 
 func runLiz(args []string) error {
@@ -111,9 +351,9 @@ func runLiz(args []string) error {
 	}
 	fmt.Printf("%sOK%s (%s)\n", cGreen, cReset, pyCmd)
 
-	// 2. Ensure claude-code-proxy is installed
-	fmt.Printf("%s  [2/4] Proxy...%s         ", cGray, cReset)
-	if err := ensureProxy(pyCmd); err != nil {
+	// 2. Ensure litellm is installed (we no longer need claude-code-proxy)
+	fmt.Printf("%s  [2/4] Proxy deps...%s    ", cGray, cReset)
+	if err := ensureDeps(pyCmd); err != nil {
 		fmt.Printf("%sFAIL%s\n", cRed, cReset)
 		return err
 	}
@@ -131,7 +371,6 @@ func runLiz(args []string) error {
 	// 4. Start proxy + launch Claude Code
 	fmt.Printf("%s  [4/4] Starting...%s      ", cGray, cReset)
 
-	// Write proxy script to temp
 	tmpDir := os.TempDir()
 	proxyPath := filepath.Join(tmpDir, "liz-proxy.py")
 	if err := os.WriteFile(proxyPath, []byte(proxyScript), 0644); err != nil {
@@ -153,22 +392,32 @@ func runLiz(args []string) error {
 		}
 	}()
 
-	// Wait for proxy to be ready
-	port, err := waitForProxy(20 * time.Second)
+	port, err := waitForProxy(30 * time.Second)
 	if err != nil {
 		return fmt.Errorf("proxy not ready: %w", err)
 	}
 	fmt.Printf("%sOK%s (port %d)\n\n", cGreen, cReset, port)
 
-	// Launch Claude Code with proxy as the API endpoint
+	// Build clean env for Claude Code — ONLY set AUTH_TOKEN, never API_KEY
+	cleanEnv := []string{}
+	for _, e := range os.Environ() {
+		// Strip all ANTHROPIC_* vars to avoid conflicts
+		if strings.HasPrefix(e, "ANTHROPIC_") {
+			continue
+		}
+		cleanEnv = append(cleanEnv, e)
+	}
+	// Add only our auth config
+	cleanEnv = append(cleanEnv,
+		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+fmt.Sprintf("%d", port),
+		"ANTHROPIC_AUTH_TOKEN=liz-local",
+	)
+
 	cmd := exec.Command(claudePath, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(),
-		"ANTHROPIC_BASE_URL=http://127.0.0.1:"+fmt.Sprintf("%d", port),
-		"ANTHROPIC_AUTH_TOKEN=liz-local",
-	)
+	cmd.Env = cleanEnv
 
 	return cmd.Run()
 }
@@ -186,22 +435,22 @@ func findPython() (string, error) {
 	return "", fmt.Errorf("Python not found.\n    Install from https://www.python.org/downloads/\n    Mark 'Add Python to PATH' during installation")
 }
 
-func ensureProxy(pyCmd string) error {
-	// Quick check: can we import server.fastapi?
-	cmd := exec.Command(pyCmd, "-c", "import server.fastapi")
+func ensureDeps(pyCmd string) error {
+	// Check if litellm + fastapi + uvicorn are installed
+	cmd := exec.Command(pyCmd, "-c", "import litellm, fastapi, uvicorn")
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Run(); err == nil {
-		return nil // already installed
+		return nil
 	}
 
-	// Install it
-	fmt.Printf("\n%s  Installing claude-code-proxy...%s\n", cGray, cReset)
-	installCmd := exec.Command(pyCmd, "-m", "pip", "install", "claude-code-proxy")
+	fmt.Printf("\n%s  Installing dependencies (litellm, fastapi, uvicorn)...%s\n", cGray, cReset)
+	installCmd := exec.Command(pyCmd, "-m", "pip", "install", "--quiet",
+		"litellm", "fastapi", "uvicorn", "httpx")
 	installCmd.Stdout = os.Stdout
 	installCmd.Stderr = os.Stderr
 	if err := installCmd.Run(); err != nil {
-		return fmt.Errorf("install claude-code-proxy: %w", err)
+		return fmt.Errorf("install dependencies: %w", err)
 	}
 	return nil
 }
@@ -211,7 +460,6 @@ func ensureClaude() (string, error) {
 		return path, nil
 	}
 
-	// Check if npm is available
 	if _, err := exec.LookPath("npm"); err != nil {
 		return "", fmt.Errorf("Claude Code not found and npm not available.\n    Install Node.js from https://nodejs.org/")
 	}
@@ -239,9 +487,7 @@ func waitForProxy(timeout time.Duration) (int, error) {
 	deadline := time.Now().Add(timeout)
 	portFile := filepath.Join(os.TempDir(), "liz_port.txt")
 
-	// Try default port first, then read from port file
 	for time.Now().Before(deadline) {
-		// Try to read the port file
 		if data, err := os.ReadFile(portFile); err == nil {
 			port := strings.TrimSpace(string(data))
 			if port != "" {
@@ -254,7 +500,6 @@ func waitForProxy(timeout time.Duration) (int, error) {
 				}
 			}
 		}
-		// Also try default port directly
 		resp, err := http.Get("http://127.0.0.1:8082/")
 		if err == nil && resp.StatusCode == 200 {
 			resp.Body.Close()
